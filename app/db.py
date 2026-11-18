@@ -62,6 +62,11 @@ CREATE TABLE IF NOT EXISTS observations (
 CREATE INDEX IF NOT EXISTS idx_observations_cell
     ON observations (wafer_id, full_row, full_col);
 
+-- Lets a recompute find the coordinates touched by not-yet-published batches
+-- without scanning every observation of the wafer.
+CREATE INDEX IF NOT EXISTS idx_observations_batch
+    ON observations (batch_id);
+
 CREATE TABLE IF NOT EXISTS map_cells (
     wafer_id             TEXT NOT NULL REFERENCES wafers(wafer_id),
     full_row             INTEGER NOT NULL,

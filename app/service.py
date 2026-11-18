@@ -5,10 +5,18 @@ Two mutating paths exist and they are deliberately separated:
 * ``accept_batch`` persists an upload and advances ``accepted_seq``.  It never
   touches the published map, so the previously visible map is immediately
   marked as pending update and remains queryable.
-* ``recompute`` builds a complete snapshot from the accepted observations and
-  publishes it **only if** ``accepted_seq`` still equals the sequence the
-  snapshot was built from.  A late recompute can therefore never overwrite a
+* ``recompute`` publishes the delta between the committed map and the newest
+  accepted data **only if** ``accepted_seq`` still equals the sequence the
+  delta was computed from.  A late recompute can therefore never overwrite a
   map that already contains newer measurements.
+
+Publication is incremental: the coordinates touched by not-yet-published
+batches are derived from the observations those batches wrote (every accepted
+batch stamps its observations with its own ``batch_id``), only those
+coordinates are re-evaluated, and only those map cells are upserted.  Compute
+and writes therefore grow with the number of affected coordinates, not with
+the wafer size.  When the map is already current, ``recompute`` performs no
+cell work at all.
 
 Map cells, their sources and ``committed_seq`` are written in one SQLite
 transaction, so after a failure or restart they always belong to the same
@@ -34,13 +42,24 @@ MAX_DENSE_CELLS = 250_000
 
 @dataclass(frozen=True)
 class Snapshot:
-    """A consistent view of accepted observations for one sequence."""
+    """A consistent view of the delta waiting to be published.
+
+    ``cells`` holds the winning observation for every coordinate touched by
+    batches in ``(committed_seq, seq]`` -- and only those.  When the map is
+    already current (``up_to_date``) no cell work was performed at all.
+    """
 
     wafer_id: str
     seq: int
+    committed_seq: int
     rows: int
     cols: int
     cells: list[sqlite3.Row]
+
+    @property
+    def up_to_date(self) -> bool:
+        """True when nothing newer than the published map has been accepted."""
+        return self.seq == 0 or self.seq == self.committed_seq
 
 
 WaferStatus = Literal["empty", "pending_update", "ready"]
@@ -511,8 +530,10 @@ class WaferService:
     def recompute(self, wafer_id: str) -> dict[str, Any]:
         """Bring the published map up to date with accepted data.
 
-        Re-snapshots if newer data was accepted during computation, but never
-        publishes a snapshot whose sequence is no longer the latest.
+        Each round computes the delta since ``committed_seq`` for the newest
+        accepted sequence and publishes it only if that sequence is still the
+        latest.  A wafer whose map is already current costs one indexed row
+        read -- no observation or map-cell work happens at all.
         """
         self.get_wafer_state(wafer_id)  # 404 early
         published = False
@@ -524,7 +545,7 @@ class WaferService:
                 if seq:
                     self.record_failure(wafer_id, seq, str(exc))
                 raise
-            if snapshot.seq == 0:
+            if snapshot.up_to_date:
                 return self.recompute_status(wafer_id, scheduled=False)
             if self.recompute_delay_seconds:
                 time.sleep(self.recompute_delay_seconds)
@@ -542,41 +563,123 @@ class WaferService:
     def _build_snapshot(self, wafer_id: str) -> Snapshot:
         conn = connect(self.db_path)
         try:
-            # One read transaction gives a consistent (accepted_seq, data) pair
-            # even if acceptances commit while we read.
+            # One read transaction gives a consistent
+            # (accepted_seq, committed_seq, data) triple even if acceptances
+            # commit while we read.
             with read_snapshot(conn):
                 wafer = self._wafer_or_404(conn, wafer_id)
                 target = int(wafer["accepted_seq"])
-                cells = conn.execute(
-                    """
-                    SELECT full_row, full_col, verdict, retest_no, machine_id,
-                           batch_id, batch_seq, local_row, local_col
-                      FROM (
-                            SELECT o.full_row, o.full_col, o.verdict, o.retest_no,
-                                   o.machine_id, o.batch_id, o.local_row, o.local_col,
-                                   b.seq AS batch_seq,
-                                   ROW_NUMBER() OVER (
-                                       PARTITION BY o.full_row, o.full_col
-                                       ORDER BY o.retest_no DESC, b.seq DESC
-                                   ) AS rn
-                              FROM observations AS o
-                              JOIN batches AS b ON b.batch_id = o.batch_id
-                             WHERE o.wafer_id = ?
-                           )
-                     WHERE rn = 1
-                     ORDER BY full_row, full_col
-                    """,
-                    (wafer_id,),
-                ).fetchall()
+                committed = int(wafer["committed_seq"])
+                if target == 0 or target == committed:
+                    # Nothing accepted yet, or the published map already
+                    # reflects every acceptance: skip all cell work.
+                    return Snapshot(
+                        wafer_id=wafer_id,
+                        seq=target,
+                        committed_seq=committed,
+                        rows=int(wafer["rows"]),
+                        cols=int(wafer["cols"]),
+                        cells=[],
+                    )
+                affected = self._affected_coordinates(
+                    conn, wafer_id, committed, target
+                )
+                cells = self._winning_observations(conn, wafer_id, affected)
             return Snapshot(
                 wafer_id=wafer_id,
                 seq=target,
+                committed_seq=committed,
                 rows=int(wafer["rows"]),
                 cols=int(wafer["cols"]),
                 cells=cells,
             )
         finally:
             conn.close()
+
+    @staticmethod
+    def _affected_coordinates(
+        conn: sqlite3.Connection, wafer_id: str, committed: int, target: int
+    ) -> list[tuple[int, int]]:
+        """Coordinates whose observations changed after ``committed``.
+
+        Every accepted batch inserts its new readings -- and re-stamps the
+        readings it re-reports -- with its own ``batch_id``, so the
+        coordinates touched by unpublished batches are exactly the
+        coordinates of the observations those batches own.  The lookup is
+        driven by the unpublished batches, so its cost tracks the amount of
+        unprocessed data rather than the total number of observations.
+        """
+        rows = conn.execute(
+            """
+            SELECT DISTINCT o.full_row, o.full_col
+              FROM batches AS b
+              CROSS JOIN observations AS o
+                ON o.batch_id = b.batch_id
+             WHERE b.wafer_id = ?
+               AND b.seq > ?
+               AND b.seq <= ?
+             ORDER BY o.full_row, o.full_col
+            """,
+            (wafer_id, committed, target),
+        ).fetchall()
+        return [(int(row["full_row"]), int(row["full_col"])) for row in rows]
+
+    @staticmethod
+    def _winning_observations(
+        conn: sqlite3.Connection,
+        wafer_id: str,
+        affected: list[tuple[int, int]],
+    ) -> list[sqlite3.Row]:
+        """Highest-retest reading (latest batch breaks ties) per coordinate.
+
+        Only the affected coordinates are examined, via the
+        ``(wafer_id, full_row, full_col)`` index.
+        """
+        if not affected:
+            return []
+        conn.execute("DROP TABLE IF EXISTS temp._affected")
+        conn.execute(
+            """
+            CREATE TEMP TABLE _affected (
+                full_row INTEGER NOT NULL,
+                full_col INTEGER NOT NULL,
+                PRIMARY KEY (full_row, full_col)
+            )
+            """
+        )
+        try:
+            conn.executemany(
+                "INSERT INTO temp._affected (full_row, full_col) VALUES (?, ?)",
+                affected,
+            )
+            return conn.execute(
+                """
+                SELECT full_row, full_col, verdict, retest_no, machine_id,
+                       batch_id, batch_seq, local_row, local_col
+                  FROM (
+                        SELECT o.full_row, o.full_col, o.verdict, o.retest_no,
+                               o.machine_id, o.batch_id,
+                               o.local_row, o.local_col,
+                               b.seq AS batch_seq,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY o.full_row, o.full_col
+                                   ORDER BY o.retest_no DESC, b.seq DESC
+                               ) AS rn
+                          FROM temp._affected AS a
+                          CROSS JOIN observations AS o
+                            ON o.wafer_id = ?
+                           AND o.full_row = a.full_row
+                           AND o.full_col = a.full_col
+                          CROSS JOIN batches AS b
+                            ON b.batch_id = o.batch_id
+                       )
+                 WHERE rn = 1
+                 ORDER BY full_row, full_col
+                """,
+                (wafer_id,),
+            ).fetchall()
+        finally:
+            conn.execute("DROP TABLE IF EXISTS temp._affected")
 
     def _publish(self, snapshot: Snapshot) -> bool:
         conn = connect(self.db_path)
@@ -599,9 +702,9 @@ class WaferService:
                     # Someone already published this sequence.
                     return True
                 now = utcnow()
-                conn.execute(
-                    "DELETE FROM map_cells WHERE wafer_id = ?", (snapshot.wafer_id,)
-                )
+                # Only the affected coordinates are written.  Observations are
+                # never deleted, so every affected coordinate has a winner and
+                # an upsert suffices -- untouched cells keep their stored row.
                 conn.executemany(
                     """
                     INSERT INTO map_cells (
@@ -609,6 +712,15 @@ class WaferService:
                         source_machine_id, source_batch_id, source_batch_seq,
                         source_local_row, source_local_col, computed_seq
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (wafer_id, full_row, full_col) DO UPDATE SET
+                        verdict = excluded.verdict,
+                        source_retest_no = excluded.source_retest_no,
+                        source_machine_id = excluded.source_machine_id,
+                        source_batch_id = excluded.source_batch_id,
+                        source_batch_seq = excluded.source_batch_seq,
+                        source_local_row = excluded.source_local_row,
+                        source_local_col = excluded.source_local_col,
+                        computed_seq = excluded.computed_seq
                     """,
                     [
                         (

@@ -9,14 +9,28 @@
 
 | 规则 | 实现位置 |
 | --- | --- |
-| 同一全片位置取**最高复测号**的测判 | `service._build_snapshot` 的 `ROW_NUMBER() ... ORDER BY retest_no DESC, batch.seq DESC` |
+| 同一全片位置取**最高复测号**的测判（同号取最新批次） | `service._winning_observations` 的 `ROW_NUMBER() ... ORDER BY retest_no DESC, batch.seq DESC`，只评估受影响坐标 |
 | 未测位置留空（稀疏列表不出现，`dense=true` 时为 `null`） | `service.get_map` |
 | 相同位置 + 相同复测号 + **不同测判** → 整批 409 拒收，保留原地图 | `service._find_conflicts`（在写事务内比对） |
+| 同号同判重报更新来源 | 受理时 `ON CONFLICT` 改写观测来源；该坐标进入受影响集合，发布后地图来源指向最新批次 |
+| 小批次更新只重算、只重写**受影响坐标** | `service._affected_coordinates` 由未发布批次的观测推导坐标集；`_publish` 只 UPSERT 这些格子，其余格子不动 |
+| 地图已最新时重算不做整片处理 | `_build_snapshot` 在 `accepted_seq == committed_seq` 时直接返回空快照，不触碰观测表 |
 | 上传受理后旧地图立刻标记 `pending_update`，但仍可查询 | `accept_batch` 只推进 `accepted_seq`，不动 `map_cells` |
 | 重算期间可继续受理其它机台上传 | 计算在请求之外；受理只取 `BEGIN IMMEDIATE` 短事务 |
 | 迟到的旧重算不能覆盖新测判 | `_publish` 在写事务内校验 `accepted_seq == snapshot.seq` |
 | 重算失败/重启后仍能查询待更新状态 | `wafers.last_error_seq` 持久化；失败时 `status=pending_update` + `recompute_failed=true` |
 | 恢复后的地图与来源来自同一批已受理数据 | `map_cells` 与 `committed_seq` 同一事务写入；读接口用同一读快照 |
+
+### 增量发布链路
+
+受理只追加观测日志（`observations`，每行盖本批 `batch_id`），不重算地图。
+重算时按 `(committed_seq, accepted_seq]` 区间找到未发布批次，这些批次的观测
+所在坐标就是**受影响坐标集**——新测插入、同号同判重报都会让坐标入集，因此
+等价于一份从不漂移的脏坐标表。只对受影响坐标求最高复测号的胜测判，并在
+一个写事务里 UPSERT 对应 `map_cells` 行 + 推进 `committed_seq`。计算与写入
+随受影响坐标数增长，而非整片规模；观测永不删除，所以受影响坐标必有胜测判，
+无需删除地图行。每格 `computed_seq` 记录该格最近一次重算对应的序号
+（`<= committed_seq`）。
 
 ## 坐标约定
 
@@ -123,7 +137,9 @@ python3 -m pytest tests -q
 
 覆盖：四种旋转与旋转复合、最高复测号优先、空位、跨机台/跨旋转同位置冲突、
 批内重复、越界拒收、尺寸不一致、受理与发布交错、迟到快照拒发、失败后恢复、
-重启后待更新状态、四机台拼片、路径校验。
+重启后待更新状态、四机台拼片、路径校验，以及增量发布专项：小批只重写受影响
+坐标、已最新时零格子工作、受影响集合推导、连续小批上传与重算交错、
+重启后带待发布数据继续上传再恢复、增量结果与全量重算等价。
 
 ## 已知限制
 
